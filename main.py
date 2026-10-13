@@ -1,53 +1,76 @@
-import time, threading
-from scanner import get_all_futures_pairs, analyze_symbol
-from mexc_client import signed_request, get_open_positions, get_ticker_price
+import time
+import requests
+import os
+from datetime import datetime
 
-TAKE = 12.0
-STOP = -6.0
+# ========== SOFIA V4.5 - TODOS OS FUTUROS ==========
+MODO_REAL = True
+LEVERAGE = 5
+VOL = 1
+INTERVALO_SCAN = 60
+VOL_MIN_X = 1.5
+# ===================================================
 
-def open_position(symbol, side):
-    side_code = 1 if side=="LONG" else 3 # 1=LONG 3=SHORT MEXC
-    print(f"🚀 ABRINDO {side} {symbol} 5x", flush=True)
-    params = {"symbol": symbol, "vol": 1, "side": side_code, "type": 5, "openType": 1, "leverage": 5}
+import mexc_client
+
+def get_all_futures():
     try:
-        res = signed_request("POST", "/api/v1/private/order/submit", params)
-        print(f"Resultado: {res}", flush=True)
-    except Exception as e: print(e)
+        # Pega TODOS os contratos, não só USDT
+        r = requests.get("https://api.mexc.com/api/v1/contract/ticker", timeout=20).json()
+        data = r.get('data', [])
+        symbols = [x['symbol'] for x in data] # <--- TODOS, STOCK, USDC, BTC, tudo
+        print(f"Encontrados {len(symbols)} contratos na MEXC", flush=True)
+        return symbols
+    except Exception as e:
+        print(f"Erro ao pegar lista: {e} - usando fallback", flush=True)
+        return ["BTC_USDT", "ETH_USDT", "SOL_USDT", "AVAX_USDT"]
 
-def vendedor_thread():
+def analyze_symbol(symbol):
+    try:
+        r = requests.get(f"https://api.mexc.com/api/v1/contract/kline/{symbol}", 
+                         params={"interval":"Min5"}, timeout=10).json()
+        data = r.get("data", {})
+        if not data or not data.get("close"): return None
+        closes = [float(c) for c in data.get("close",[]) if c]
+        vols = [float(v) for v in data.get("vol",[]) if v]
+        if len(closes) < 30: return None
+        
+        ma20 = sum(closes[-20:]) / 20
+        ma50 = sum(closes[-50:]) / 50 if len(closes) >= 50 else ma20
+        vol_media = sum(vols[-20:]) / 20 if len(vols) >= 20 else 1
+        vol_atual = vols[-1] if vols else 0
+        vol_x = vol_atual / vol_media if vol_media > 0 else 0
+        price = closes[-1]
+        
+        if price > ma20 and ma20 > ma50 and vol_x >= VOL_MIN_X:
+            return {"symbol": symbol, "lado": "long", "vol_x": round(vol_x,2)}
+        if price < ma20 and ma20 < ma50 and vol_x >= VOL_MIN_X:
+            return {"symbol": symbol, "lado": "short", "vol_x": round(vol_x,2)}
+        return None
+    except Exception as e:
+        # Não quebra por causa de um par estranho
+        return None
+
+def main():
     while True:
         try:
-            for pos in get_open_positions():
-                sym = pos["symbol"]
-                entry = float(pos["holdAvgPrice"])
-                current = get_ticker_price(sym)
-                # Calcula PnL para LONG e SHORT
-                if pos["holdSide"] == 1: pnl = (current-entry)/entry*100*5 # LONG
-                else: pnl = (entry-current)/entry*100*5 # SHORT
-                print(f"Pos {sym} PnL {pnl:.1f}%", flush=True)
-                if pnl >= TAKE or pnl <= STOP:
-                    print(f"{'🎯 LUCRO' if pnl>0 else '🛑 STOP'} FECHANDO {sym} {pnl:.1f}%", flush=True)
-                    # Fecha
-                    close_side = 2 if pos["holdSide"]==1 else 4
-                    signed_request("POST","/api/v1/private/order/submit",{"symbol":sym,"vol":pos["holdVol"],"side":close_side,"type":5,"openType":1})
-        except Exception as e: print(f"Erro vendedor: {e}")
-        time.sleep(10)
+            symbols = get_all_futures()
+            print(f"=== SOFIA V4.5 SCAN {len(symbols)} FUTUROS (TODOS) LONG+SHORT REAL={MODO_REAL} === {datetime.now()}", flush=True)
+            for sym in symbols:
+                sinal = analyze_symbol(sym)
+                if sinal:
+                    print(f"✅ {sinal['lado'].upper()} {sinal['symbol']} vol_x{sinal['vol_x']}", flush=True)
+                    if MODO_REAL:
+                        print(f"🚀 ABRINDO {sinal['lado'].upper()} {sinal['symbol']} {LEVERAGE}x", flush=True)
+                        res = mexc_client.open_market_order(sinal['symbol'], sinal['lado'], VOL, LEVERAGE)
+                        print(f"Resultado: {res}", flush=True)
+                    time.sleep(1)
 
-def scanner_thread():
-    while True:
-        try:
-            pares = get_all_futures_pairs()
-            print(f"\n=== SOFIA V4.5 SCAN {len(pares)} FUTUROS LONG+SHORT ===", flush=True)
-            for sym in pares[:80]:
-                time.sleep(0.25)
-                sig = analyze_symbol(sym)
-                if sig:
-                    print(f"✅ {sig['side']} {sym} vol_x{sig['vol_x']:.1f}", flush=True)
-                    open_position(sym, sig["side"])
-            print("Aguardando 60s...", flush=True)
-            time.sleep(60)
-        except Exception as e: print(f"Erro scanner: {e}"); time.sleep(30)
+            print(f"Aguardando {INTERVALO_SCAN}s...", flush=True)
+            time.sleep(INTERVALO_SCAN)
+        except Exception as e:
+            print(f"Erro loop: {e}", flush=True)
+            time.sleep(10)
 
 if __name__ == "__main__":
-    threading.Thread(target=vendedor_thread, daemon=True).start()
-    scanner_thread()
+    main()
